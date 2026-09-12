@@ -1,8 +1,66 @@
-use std::fs::File;
 use std::io::{Result, Write};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+/// The user's home directory.
+static HOME_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+});
+
+/// Writes a line to stdout.
+///
+/// `println!` panics if stdout is closed, which happens routinely when output
+/// is piped (`key-watch hook install | head`). A closed pipe is a normal way
+/// for a reader to stop listening, so it is reported as success.
+pub fn emit_line(line: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{line}") {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
+    }
+}
+
+/// The user's home directory: `$HOME`, falling back to `$USERPROFILE` (the
+/// Windows convention). Callers with platform-specific fallback orders
+/// (hooks resolve XDG/APPDATA first) resolve their own.
+pub fn home_dir() -> Option<&'static PathBuf> {
+    HOME_DIR.as_ref()
+}
+
+/// Renders a path for terminal output, abbreviating the home directory as `~`.
+pub fn display_path(path: &Path) -> String {
+    match HOME_DIR
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Writes a report file readable only by its owner.
+///
+/// `File::create` uses 0666 & ~umask, i.e. world-readable by default, and a
+/// report can carry matched text when `--show-secrets` is set. The mode is
+/// also forced on an existing file, whose old (possibly world-readable)
+/// permissions would otherwise survive the rewrite.
 pub fn write_to_file(path: &str, content: &str) -> Result<()> {
-    let mut file = File::create(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(content.as_bytes())?;
     Ok(())
 }

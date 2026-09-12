@@ -1,7 +1,26 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, str::FromStr};
+use thiserror::Error;
 mod sarif;
+
+/// Characters of a match kept visible in a redacted report.
+const VISIBLE_PREFIX_CHARS: usize = 4;
+/// Matches shorter than this show no prefix at all: four visible characters
+/// would reveal most or all of the secret.
+const MIN_LENGTH_FOR_PREFIX: usize = 8;
+
+/// Keeps enough to identify a finding without reproducing the credential:
+/// the first few characters and the length. Short matches show the length
+/// only.
+pub fn redact(matched: &str) -> String {
+    let length = matched.chars().count();
+    if length < MIN_LENGTH_FOR_PREFIX {
+        return format!("({length} chars, redacted)");
+    }
+    let visible: String = matched.chars().take(VISIBLE_PREFIX_CHARS).collect();
+    format!("{visible}... ({length} chars, redacted)")
+}
 
 pub use sarif::create_sarif_report;
 
@@ -27,22 +46,11 @@ impl Severity {
 }
 
 /// Error returned when a string cannot be parsed as a [`Severity`].
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Error, PartialEq)]
+#[error("invalid severity '{input}': expected one of CRITICAL, HIGH, MEDIUM, LOW")]
 pub struct ParseSeverityError {
     pub input: String,
 }
-
-impl fmt::Display for ParseSeverityError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid severity '{}': expected one of CRITICAL, HIGH, MEDIUM, LOW",
-            self.input
-        )
-    }
-}
-
-impl std::error::Error for ParseSeverityError {}
 
 impl FromStr for Severity {
     type Err = ParseSeverityError;
@@ -99,21 +107,49 @@ pub enum ScanStatus {
     Fail,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Finding {
     pub file_path: String,
     pub line_number: usize,
     pub finding_type: String,
     pub severity: Severity,
     pub matched_content: String,
-    pub plugin_name: String,
+    /// The detector that produced this finding. The domain calls these
+    /// detectors; the wire format keeps the historical `plugin_name` key
+    /// (with an alias on deserialize) so existing report consumers are
+    /// unaffected.
+    #[serde(rename = "plugin_name", alias = "detector_name")]
+    pub detector_name: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct ScanMetadata {
     pub files_scanned: usize,
     pub total_lines: usize,
     pub excluded_files: Vec<String>,
+    /// Paths whose content could not be read (git-rendered binary). Unlike
+    /// exclusions these were never seen by the scanner, so they are reported
+    /// separately instead of masquerading as operator-requested skips.
+    pub unscannable_files: Vec<String>,
+    pub suppressed_by_baseline: usize,
+}
+
+/// How many paths an exclusion removed, and a bounded sample of them.
+#[derive(Serialize, Clone, Default)]
+pub struct ExcludedSummary {
+    pub count: usize,
+    pub sample: Vec<String>,
+}
+
+impl ExcludedSummary {
+    const SAMPLE_LIMIT: usize = 20;
+
+    pub fn from_paths(paths: &[String]) -> Self {
+        Self {
+            count: paths.len(),
+            sample: paths.iter().take(Self::SAMPLE_LIMIT).cloned().collect(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -122,41 +158,69 @@ pub struct Report {
     pub findings: Vec<Finding>,
     pub files_scanned: usize,
     pub total_lines: usize,
-    pub excluded_files: Vec<String>,
+    pub excluded: ExcludedSummary,
+    pub unscannable: ExcludedSummary,
+    pub suppressed_by_baseline: usize,
     pub scan_time: String,
 }
 
+/// Builds the JSON report. Matched text is redacted unless the operator
+/// passed `--show-secrets`: reports are routinely written to files or
+/// uploaded as CI artifacts, which would otherwise turn the scanner into an
+/// exfiltration channel.
 pub fn create_report(
     findings: Vec<Finding>,
     metadata: ScanMetadata,
     scan_time: String,
+    show_secrets: bool,
 ) -> Result<String, serde_json::Error> {
     let status = if findings.is_empty() {
         ScanStatus::Pass
     } else {
         ScanStatus::Fail
     };
+    let findings = if show_secrets {
+        findings
+    } else {
+        findings
+            .into_iter()
+            .map(|finding| Finding {
+                matched_content: redact(&finding.matched_content),
+                ..finding
+            })
+            .collect()
+    };
     let report = Report {
         status,
         findings,
         files_scanned: metadata.files_scanned,
         total_lines: metadata.total_lines,
-        excluded_files: metadata.excluded_files,
+        excluded: ExcludedSummary::from_paths(&metadata.excluded_files),
+        unscannable: ExcludedSummary::from_paths(&metadata.unscannable_files),
+        suppressed_by_baseline: metadata.suppressed_by_baseline,
         scan_time,
     };
 
     serde_json::to_string_pretty(&report)
 }
 
-pub fn get_severity_counts(findings: &[Finding]) -> (usize, usize, usize, usize) {
-    let mut counts = (0, 0, 0, 0);
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SeverityCounts {
+    pub critical: usize,
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+}
+
+pub fn get_severity_counts(findings: &[Finding]) -> SeverityCounts {
+    let mut counts = SeverityCounts::default();
     for finding in findings {
-        counts = match finding.severity {
-            Severity::Critical => (counts.0 + 1, counts.1, counts.2, counts.3),
-            Severity::High => (counts.0, counts.1 + 1, counts.2, counts.3),
-            Severity::Medium => (counts.0, counts.1, counts.2 + 1, counts.3),
-            Severity::Low => (counts.0, counts.1, counts.2, counts.3 + 1),
-        };
+        match finding.severity {
+            Severity::Critical => counts.critical += 1,
+            Severity::High => counts.high += 1,
+            Severity::Medium => counts.medium += 1,
+            Severity::Low => counts.low += 1,
+        }
     }
     counts
 }

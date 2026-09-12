@@ -4,6 +4,74 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `scan --staged` scans only the lines a commit adds
+- Baselines are auto-discovered from `.keywatch-baseline.json`; `--no-baseline-discovery` opts out
+- `update-baseline` workflow regenerates the baseline via a pull request
+
+### Changed
+
+- Pre-commit hooks scan the staged diff instead of whole files
+- Config discovery searches parent directories up to the repository root
+- Hook messages abbreviate the home directory as `~`
+
+### Added
+
+- CI scans this repository with KeyWatch and fails if the committed baseline has drifted
+- `--prune-baseline` rewrites the baseline from current findings, dropping entries for deleted files and rotated credentials; requires `--update-baseline` and a whole-tree scan, and prints what it dropped
+
+### Changed
+
+- Reports redact matched text by default; `--show-secrets` opts into raw values, and matches shorter than 8 characters are always described by length only
+- Reports summarise exclusions as a count plus a sample instead of listing every path, and report git-rendered binary files as `unscannable` rather than `excluded`
+- Lockfiles (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `go.sum`, and other generated manifests) are excluded from scans by default
+
+### Fixed
+
+- `scan --git-history` applies `--exclude`, skips the baseline file, and reports real file paths instead of a synthetic `<git-history>` key that no baseline could match
+- `scan --staged` is not fooled by `diff.relative`, which made git drop changes outside the current directory
+- `--output` files are readable only by their owner, including when the file already existed with wider permissions
+- Config is not trusted from a world-writable directory or file, so a `.keywatch.toml` dropped in `/tmp` cannot weaken scans beneath it
+- `KEYWATCH_CONFIG_PATH` is ignored in trusted mode whenever it points inside the tree being scanned, wherever the process runs from
+- Baseline suppression reports how many findings it hid, instead of applying silently
+- `CreditCardDetector` requires an issuer prefix and a valid Luhn checksum, instead of matching any 13-16 digit run; Discover's 644-649 and 65 ranges are covered
+- `HighEntropyDetector` could never fire (its 4.0 threshold is the ceiling for hex) and now runs, restricted to lines naming a credential
+- PKCS#8 private key headers (`BEGIN PRIVATE KEY`, `BEGIN ENCRYPTED PRIVATE KEY`) are detected
+- `PhoneNumberDetector` needs punctuation or a country code, so unix timestamps are not phone numbers
+- Detectors can require a structural check via `validate = "luhn"`
+- Hooks use built-in detectors, so a `detectors.toml` committed to a scanned repository can no longer replace the detector set and disable its own scan
+- Files git renders as binary (including text marked `-diff` in `.gitattributes`) are read from the index instead of being reported clean
+- `Base64Detector` matches from 28 characters, the length where entropy can actually separate base64 from identifiers
+- `scan --staged` no longer misses findings under `color.ui = always` or custom diff prefixes
+- Non-UTF-8 files no longer abort a staged scan
+- A malformed diff hunk header is reported instead of silently attributing its findings to line 0
+- Diff paths that git quoted (names containing quotes or control characters) are unescaped before attribution
+- The baseline file is no longer scanned as input to itself, including staged scans run from a subdirectory
+- `GenericKeyValueDetector` and `RandomString` no longer flag code identifiers (`let payment_method_token = card_token`, snake_case serde attributes)
+- `PasswordDetector` no longer flags `$PWD:`
+- `GenericKeyValueDetector` no longer flags bare CamelCase type paths (`token: PaymentTokenData,`)
+- `PasswordDetector` no longer flags Rust expressions (`password: Secret<String>`, `password: config.password.clone()`, `Some(Secret::new(...))`) as credentials
+- A failed `git cat-file` during a staged scan reports itself instead of claiming `git diff` failed
+- Custom rules in `.keywatch.toml` support `allowlist`, `keywords`, `entropy` and `validate`, matching built-in detector definitions
+- Pre-push repository filters fail closed on Windows drive-path remotes instead of misparsing the drive letter as a host
+- Chunked streaming scans no longer duplicate multiline matches that land inside the window overlap
+- Files with invalid UTF-8 are decoded lossily and scanned instead of silently skipped; NUL-containing files are reported as `unscannable`
+- `Finding`'s `plugin_name` field is now `detector_name` in the code; the JSON report and baseline schema still emit/accept `plugin_name`
+- `CustomRule.description` was parsed but never surfaced and has been dropped (configs carrying it keep parsing)
+- False-positive reductions in the built-in detectors: AWS's documentation example key, placeholder values (`changeme`, `your-api-key-here`, `replace-me-please`), RFC 2606 example-domain emails and noreply conventions, fictional 555 phone numbers, npm/shield checksum prefixes, and non-Verhoeff 12-digit runs no longer report as Aadhaar
+- `--baseline` naming a missing file is an error instead of silently scanning with an empty baseline
+- Baseline files with an unknown format version are rejected instead of silently accepted
+- `--update-baseline` refreshes the recorded line numbers of entries it already knows, and saved baselines end with a newline
+- SARIF report property order is deterministic
+- Piping output to a closed reader no longer panics, including `hook install` and `init`; hook commands now report real output failures instead of discarding them
+
+### Performance
+
+- Keyword matching uses a single Aho-Corasick pass per line: ~3x faster file scans, ~9x faster streams
+- File scans stream line by line instead of reading whole files into memory
+- ~2.5x faster file scans: one combined prefilter pass for the keywordless detectors, an ASCII fast path for line lowering, and a byte-histogram entropy check that no longer allocates per match
+
 ## [2.0.1] - 2026-08-02
 
 ### Fixed

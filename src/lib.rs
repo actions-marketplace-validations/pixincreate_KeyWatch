@@ -21,84 +21,195 @@ use crate::report::Severity;
 
 pub const EXIT_CODE_RUNTIME_ERROR: i32 = 2;
 
-pub fn run_cli() -> Result<(), RunCliError> {
+/// Runs the requested command and returns the process exit code.
+///
+/// Only scanning produces a meaningful code (0 pass, 1 findings). Every other
+/// command reports success with 0. `main` owns the actual `process::exit`.
+pub fn run_cli() -> Result<i32, RunCliError> {
     let options = CliOptions::parse();
     options.validate()?;
 
     match options.command {
         Command::Scan(args) => run_scan_command(&args),
-        Command::Hook(args) => match args.action {
-            HookAction::Install(install_args) => {
-                hooks::install_hook(&install_args).map_err(Into::into)
+        Command::Hook(args) => {
+            match args.action {
+                HookAction::Install(install_args) => hooks::install_hook(&install_args)?,
+                HookAction::Uninstall(uninstall_args) => hooks::uninstall_hook(&uninstall_args)?,
             }
-            HookAction::Uninstall(uninstall_args) => {
-                hooks::uninstall_hook(&uninstall_args).map_err(Into::into)
-            }
-        },
-        Command::Init { shell } => {
-            print_shell_init(&shell);
-            Ok(())
+            Ok(0)
         }
-        Command::VerifyIntegrity => verify_binary_integrity(),
+        Command::Init { shell } => {
+            print_shell_init(&shell)?;
+            Ok(0)
+        }
+        Command::VerifyIntegrity => {
+            verify_binary_integrity()?;
+            Ok(0)
+        }
     }
 }
 
-fn run_scan_command(args: &ScanArgs) -> Result<(), RunCliError> {
+/// Writes a line to stdout.
+///
+/// `println!` panics if stdout is closed, which happens routinely when output
+/// is piped (`key-watch scan . | head`). A closed pipe is a normal way for a
+/// reader to stop listening, so it is reported as success; anything else is a
+/// real I/O failure and is propagated.
+fn emit(line: &str) -> Result<(), RunCliError> {
+    utils::emit_line(line).map_err(|source| RunCliError::WriteOutput { source })
+}
+
+fn run_scan_command(args: &ScanArgs) -> Result<i32, RunCliError> {
     let start = Instant::now();
+    let args = resolve_scan_args(args)?;
+    let config = load_scan_config(&args)?;
+    let (mut findings, mut scan_metadata) = scanner::run_scan(&args, config.as_ref())?;
 
-    let config = if args.config.is_some() || !args.no_config_discovery {
-        config::KeywatchConfig::load_for_paths(args.config.as_deref(), &args.paths)?
-    } else {
-        None
+    // Pruning rewrites the baseline from what the scan actually found, so the
+    // existing entries must not filter those findings away first.
+    let prune = args.prune_baseline && args.update_baseline;
+    let mut loaded_baseline = match args.baseline.as_deref() {
+        Some(path) => Some(baseline::Baseline::load(std::path::Path::new(path))?),
+        None => None,
     };
-    let (mut findings, scan_metadata) = scanner::run_scan(args, config.as_ref())?;
-
-    if let Some(ref baseline_path) = args.baseline {
-        let baseline = baseline::Baseline::load(std::path::Path::new(baseline_path))?;
+    if let Some(baseline) = &loaded_baseline.as_ref().filter(|_| !prune) {
+        let before = findings.len();
         findings = baseline.filter_findings(findings);
+        scan_metadata.suppressed_by_baseline = before - findings.len();
     }
 
     if args.update_baseline {
-        let baseline_path = args
-            .baseline
-            .as_ref()
-            .ok_or(RunCliError::MissingBaselineForUpdate)?;
-        let mut baseline = baseline::Baseline::load(std::path::Path::new(baseline_path))?;
-        baseline.update_with_findings(&findings);
-        baseline.save(std::path::Path::new(baseline_path))?;
-        println!("Baseline updated: {}", baseline_path);
-        return Ok(());
+        update_baseline(&args, &findings, &mut loaded_baseline, prune)?;
+        return Ok(0);
     }
 
-    let elapsed = start.elapsed();
-    let scan_time = format!(
-        "{}.{:01}s",
-        elapsed.as_secs(),
-        elapsed.subsec_millis() / 100
-    );
+    emit_scan_result(&args, findings, scan_metadata, start)
+}
+
+/// Resolves the baseline like config: an explicit `--baseline` wins,
+/// otherwise discover `.keywatch-baseline.json` in the scanned tree.
+/// `--update-baseline` with nothing discovered creates the conventional file
+/// in the current directory. The resolved path also gets excluded from
+/// scanning.
+fn resolve_scan_args(args: &ScanArgs) -> Result<ScanArgs, RunCliError> {
+    let mut args = args.clone();
+    if args.baseline.is_none() && !args.no_baseline_discovery {
+        args.baseline = baseline::discover_baseline_path(&args.paths);
+        if args.baseline.is_none() && args.update_baseline {
+            args.baseline = Some(baseline::DEFAULT_BASELINE_NAME.to_string());
+        }
+    }
+
+    // Discovery only ever resolves existing files, so a missing baseline here
+    // means an explicit --baseline typo. Without --update-baseline nothing
+    // will create it, and scanning with a silently-empty baseline would
+    // report suppression that never happens.
+    if let Some(baseline_path) = args.baseline.as_deref() {
+        if !args.update_baseline && !std::path::Path::new(baseline_path).exists() {
+            return Err(RunCliError::BaselineNotFound {
+                path: baseline_path.to_string(),
+            });
+        }
+    }
+
+    Ok(args)
+}
+
+fn load_scan_config(args: &ScanArgs) -> Result<Option<config::KeywatchConfig>, RunCliError> {
+    match args.config.is_some() || !args.no_config_discovery {
+        true => config::KeywatchConfig::load_for_paths(args.config.as_deref(), &args.paths)
+            .map_err(Into::into),
+        false => Ok(None),
+    }
+}
+
+/// Writes the baseline after the scan.
+///
+/// Pruning rebuilds it from what the scan actually found. The drop count and
+/// the narrowed scope stay visible: a narrowed scan would otherwise silently
+/// delete entries for locations it never looked at.
+fn update_baseline(
+    args: &ScanArgs,
+    findings: &[Finding],
+    loaded_baseline: &mut Option<baseline::Baseline>,
+    prune: bool,
+) -> Result<(), RunCliError> {
+    let baseline_path = args
+        .baseline
+        .as_ref()
+        .ok_or(RunCliError::MissingBaselineForUpdate)?;
+    let baseline = loaded_baseline
+        .as_mut()
+        .ok_or(RunCliError::MissingBaselineForUpdate)?;
+
+    if prune {
+        let stale = baseline.entries.len();
+        *baseline = baseline::Baseline::from_findings(findings);
+        let dropped = stale.saturating_sub(baseline.entries.len());
+        if dropped > 0 {
+            let noun = if dropped == 1 { "entry" } else { "entries" };
+            emit(&format!(
+                "Pruned {dropped} baseline {noun} not found by this scan"
+            ))?;
+        }
+        if !scan_covers_paths(&args.paths) {
+            emit(
+                "WARNING: --prune-baseline rebuilt the baseline from the scanned paths only; findings outside them are no longer baselined",
+            )?;
+        }
+    } else {
+        baseline.update_with_findings(findings);
+    }
+
+    baseline.save(std::path::Path::new(baseline_path))?;
+    emit(&format!("Baseline updated: {baseline_path}"))
+}
+
+/// Emits the report, the suppression notice and the summary, writes
+/// `--output` when requested, and returns the process exit code.
+fn emit_scan_result(
+    args: &ScanArgs,
+    findings: Vec<Finding>,
+    scan_metadata: report::ScanMetadata,
+    start: Instant,
+) -> Result<i32, RunCliError> {
+    let scan_time = format_scan_time(start.elapsed());
+    let suppressed = scan_metadata.suppressed_by_baseline;
     let severity_counts = report::get_severity_counts(&findings);
     let exit_code = calculate_exit_code(&findings, &args.exit_mode);
     let findings_count = findings.len();
     let report_out = match args.format {
-        OutputFormat::Json => report::create_report(findings, scan_metadata, scan_time),
+        OutputFormat::Json => {
+            report::create_report(findings, scan_metadata, scan_time, args.show_secrets)
+        }
         OutputFormat::Sarif => report::create_sarif_report(findings, scan_metadata, scan_time),
     }
     .map_err(|source| RunCliError::ReportSerialize { source })?;
 
-    if args.verbose {
-        println!("{report_out}");
-    } else if findings_count == 0 {
-        println!("No secrets found.");
-    } else {
-        println!(
-            "WARNING: {} potential secret(s) detected (CRITICAL: {}, HIGH: {}, MEDIUM: {}, LOW: {})",
-            findings_count,
-            severity_counts.0,
-            severity_counts.1,
-            severity_counts.2,
-            severity_counts.3
-        );
+    if suppressed > 0 && !args.verbose {
+        emit(&format!(
+            "Suppressed {} finding(s) via {}",
+            suppressed,
+            args.baseline
+                .as_deref()
+                .map(|path| utils::display_path(std::path::Path::new(path)))
+                .unwrap_or_else(|| "baseline".to_string())
+        ))?;
     }
+
+    let summary = match findings_count {
+        _ if args.verbose => report_out.clone(),
+        0 => "No secrets found.".to_string(),
+        count => format!(
+            "WARNING: {} potential secret(s) detected (CRITICAL: {}, HIGH: {}, MEDIUM: {}, LOW: {})",
+            count,
+            severity_counts.critical,
+            severity_counts.high,
+            severity_counts.medium,
+            severity_counts.low
+        ),
+    };
+    emit(&summary)?;
 
     if let Some(ref output_path) = args.output {
         utils::write_to_file(output_path, &report_out).map_err(|source| {
@@ -109,10 +220,36 @@ fn run_scan_command(args: &ScanArgs) -> Result<(), RunCliError> {
         })?;
     }
 
-    std::process::exit(exit_code);
+    Ok(exit_code)
 }
 
-fn print_shell_init(shell: &Shell) {
+fn format_scan_time(elapsed: std::time::Duration) -> String {
+    format!(
+        "{}.{:01}s",
+        elapsed.as_secs(),
+        elapsed.subsec_millis() / 100
+    )
+}
+
+/// Whether the scan inputs cover the whole tree around the baseline, i.e.
+/// pruning cannot silently drop entries for locations the scan never looked
+/// at. An empty path list means the current directory; a lone "." or an
+/// explicit path naming the current directory counts as the whole tree.
+fn scan_covers_paths(paths: &[String]) -> bool {
+    match paths {
+        [] => true,
+        [single] => {
+            single == "."
+                || std::fs::canonicalize(single)
+                    .ok()
+                    .zip(std::env::current_dir().ok())
+                    .is_some_and(|(canonical, cwd)| canonical == cwd)
+        }
+        _ => false,
+    }
+}
+
+fn print_shell_init(shell: &Shell) -> Result<(), RunCliError> {
     let script = match shell {
         Shell::Fish => "alias keywatch 'key-watch'\nalias kw 'key-watch'\n",
         Shell::Bash | Shell::Zsh | Shell::Posix => {
@@ -120,7 +257,7 @@ fn print_shell_init(shell: &Shell) {
         }
     };
 
-    print!("{script}");
+    emit(script.trim_end())
 }
 
 fn verify_binary_integrity() -> Result<(), RunCliError> {
@@ -139,9 +276,8 @@ fn verify_binary_integrity() -> Result<(), RunCliError> {
         }
     }
 
-    println!("Binary integrity verified: {:?}", exe_path);
-    println!("Size: {} bytes", metadata.len());
-    Ok(())
+    emit(&format!("Binary integrity verified: {exe_path:?}"))?;
+    emit(&format!("Size: {} bytes", metadata.len()))
 }
 
 fn calculate_exit_code(findings: &[Finding], exit_mode: &ExitMode) -> i32 {
@@ -152,10 +288,10 @@ fn calculate_exit_code(findings: &[Finding], exit_mode: &ExitMode) -> i32 {
     match exit_mode {
         ExitMode::Always => 0,
         ExitMode::Critical => {
-            let has_critical_or_high = findings.iter().any(|finding| {
-                finding.severity == Severity::Critical || finding.severity == Severity::High
-            });
-            if has_critical_or_high { 1 } else { 0 }
+            let has_critical_or_high = findings
+                .iter()
+                .any(|finding| matches!(finding.severity, Severity::Critical | Severity::High));
+            i32::from(has_critical_or_high)
         }
         ExitMode::Strict => 1,
     }
@@ -175,7 +311,7 @@ mod tests {
             finding_type: "Critical".to_string(),
             severity: Severity::Critical,
             matched_content: "secret".to_string(),
-            plugin_name: "DetectorCritical".to_string(),
+            detector_name: "DetectorCritical".to_string(),
         };
         let high = Finding {
             file_path: "high.txt".to_string(),
@@ -183,7 +319,7 @@ mod tests {
             finding_type: "High".to_string(),
             severity: Severity::High,
             matched_content: "secret".to_string(),
-            plugin_name: "DetectorHigh".to_string(),
+            detector_name: "DetectorHigh".to_string(),
         };
         let low = Finding {
             file_path: "low.txt".to_string(),
@@ -191,7 +327,7 @@ mod tests {
             finding_type: "Low".to_string(),
             severity: Severity::Low,
             matched_content: "token".to_string(),
-            plugin_name: "DetectorLow".to_string(),
+            detector_name: "DetectorLow".to_string(),
         };
 
         assert_eq!(calculate_exit_code(&[], &ExitMode::Strict), 0);

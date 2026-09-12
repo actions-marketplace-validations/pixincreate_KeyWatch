@@ -1,42 +1,26 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::error::Error;
-use std::fmt::{Display, Formatter};
+use thiserror::Error;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CliValidationError {
+    #[error("Cannot specify both --git-history and --stdin")]
     GitHistoryWithStdin,
+    #[error("Cannot specify more than one path with --git-history")]
     GitHistoryWithMultiplePaths,
+    #[error("Cannot specify both --staged and --stdin")]
+    StagedWithStdin,
+    #[error("Cannot specify both --staged and --git-history")]
+    StagedWithGitHistory,
+    #[error("Cannot specify both --stdin and paths")]
     StdinWithPaths,
+    #[error("Must specify paths, use --stdin, --staged, or --git-history")]
     MissingScanInput,
+    #[error("--allowed-repos and --blocked-repos are only supported for pre-push hooks")]
     PreCommitRepositoryFilters,
+    #[error("--exclude is only supported for pre-commit hooks")]
     PrePushExclude,
 }
-
-impl Display for CliValidationError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::GitHistoryWithStdin => {
-                formatter.write_str("Cannot specify both --git-history and --stdin")
-            }
-            Self::GitHistoryWithMultiplePaths => {
-                formatter.write_str("Cannot specify more than one path with --git-history")
-            }
-            Self::StdinWithPaths => formatter.write_str("Cannot specify both --stdin and paths"),
-            Self::MissingScanInput => {
-                formatter.write_str("Must specify paths, use --stdin, or use --git-history")
-            }
-            Self::PreCommitRepositoryFilters => formatter.write_str(
-                "--allowed-repos and --blocked-repos are only supported for pre-push hooks",
-            ),
-            Self::PrePushExclude => {
-                formatter.write_str("--exclude is only supported for pre-commit hooks")
-            }
-        }
-    }
-}
-
-impl Error for CliValidationError {}
 
 /// KeyWatch: A secret scanner for your files and directories.
 #[derive(Parser, Debug)]
@@ -74,7 +58,7 @@ pub enum Command {
     VerifyIntegrity,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone, Default)]
 pub struct ScanArgs {
     /// Paths to scan (files or directories)
     pub paths: Vec<String>,
@@ -87,6 +71,10 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub git_history: bool,
 
+    /// Scan only the lines staged for commit (paths narrow the staged diff)
+    #[arg(long, default_value_t = false)]
+    pub staged: bool,
+
     /// Output the result to a file
     #[arg(short, long)]
     pub output: Option<String>,
@@ -94,6 +82,10 @@ pub struct ScanArgs {
     /// Print the scan results to the console
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
+
+    /// Include raw matched text in reports (default: redacted)
+    #[arg(long, default_value_t = false)]
+    pub show_secrets: bool,
 
     /// Paths to exclude from scanning (comma-separated, supports glob patterns)
     #[arg(long)]
@@ -104,12 +96,26 @@ pub struct ScanArgs {
     pub exit_mode: ExitMode,
 
     /// Path to a baseline file for suppressing known findings
+    /// (defaults to a discovered .keywatch-baseline.json)
     #[arg(long)]
     pub baseline: Option<String>,
+
+    /// Disable automatic baseline discovery (an explicit --baseline still loads)
+    #[arg(long, default_value_t = false)]
+    pub no_baseline_discovery: bool,
 
     /// Update the baseline file with current findings instead of scanning
     #[arg(long)]
     pub update_baseline: bool,
+
+    /// Rewrite the baseline from the current findings, dropping stale entries
+    /// (requires --update-baseline; whole-tree scans only)
+    #[arg(
+        long,
+        requires = "update_baseline",
+        conflicts_with_all = ["staged", "stdin", "git_history"]
+    )]
+    pub prune_baseline: bool,
 
     /// Path to .keywatch.toml config file
     #[arg(long)]
@@ -126,22 +132,21 @@ pub struct ScanArgs {
 
 impl ScanArgs {
     pub fn validate(&self) -> Result<(), CliValidationError> {
-        if self.git_history {
-            if self.stdin {
-                return Err(CliValidationError::GitHistoryWithStdin);
+        match (self.git_history, self.staged, self.stdin) {
+            (true, true, _) => Err(CliValidationError::StagedWithGitHistory),
+            (true, _, true) => Err(CliValidationError::GitHistoryWithStdin),
+            (true, false, false) if self.paths.len() > 1 => {
+                Err(CliValidationError::GitHistoryWithMultiplePaths)
             }
-            if self.paths.len() > 1 {
-                return Err(CliValidationError::GitHistoryWithMultiplePaths);
+            (false, true, true) => Err(CliValidationError::StagedWithStdin),
+            (false, false, true) if !self.paths.is_empty() => {
+                Err(CliValidationError::StdinWithPaths)
             }
-            return Ok(());
+            (false, false, false) if self.paths.is_empty() => {
+                Err(CliValidationError::MissingScanInput)
+            }
+            _ => Ok(()),
         }
-        if self.stdin && !self.paths.is_empty() {
-            return Err(CliValidationError::StdinWithPaths);
-        }
-        if !self.stdin && self.paths.is_empty() {
-            return Err(CliValidationError::MissingScanInput);
-        }
-        Ok(())
     }
 }
 
@@ -245,45 +250,17 @@ pub enum Shell {
     Posix,
 }
 
-impl Shell {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Bash => "bash",
-            Self::Zsh => "zsh",
-            Self::Fish => "fish",
-            Self::Posix => "posix",
-        }
-    }
-}
-
-#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+#[derive(ValueEnum, Clone, Debug, Default, PartialEq, Eq)]
 pub enum ExitMode {
     Always,
     Critical,
+    #[default]
     Strict,
 }
 
-#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+#[derive(ValueEnum, Clone, Debug, Default, PartialEq, Eq)]
 pub enum OutputFormat {
+    #[default]
     Json,
     Sarif,
-}
-
-impl OutputFormat {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Json => "json",
-            Self::Sarif => "sarif",
-        }
-    }
-}
-
-impl ExitMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Always => "always",
-            Self::Critical => "critical",
-            Self::Strict => "strict",
-        }
-    }
 }
