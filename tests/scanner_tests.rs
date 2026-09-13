@@ -1,4 +1,5 @@
 use key_watch::cli::ScanArgs;
+use key_watch::report::create_report;
 use key_watch::scanner::{ScannerError, run_scan};
 use std::env::temp_dir;
 use std::fs;
@@ -121,7 +122,25 @@ sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX\n\
     };
 
     let (findings, _) = run_scan(&options, None).expect("run_scan should succeed");
-    assert!(!findings.is_empty(), "Should find secrets");
+    let finding_types: Vec<&str> = findings
+        .iter()
+        .map(|finding| finding.finding_type.as_str())
+        .collect();
+    assert_eq!(
+        finding_types,
+        vec![
+            "AWS Access Key",
+            // PasswordDetector and GenericKeyValueDetector match the same
+            // password line; the overlap collapses to one finding.
+            "Generic Key/Secret",
+            "SendGrid API Key",
+            "Base64 Encoded String",
+            "Base64 Encoded String",
+            // The OpenAI and Kimi detectors match the same sk- token.
+            "Kimi/Moonshot API Key",
+        ],
+        "Should find secrets"
+    );
 
     fs::remove_file(test_file).expect("Cleanup");
 }
@@ -145,7 +164,14 @@ Stripe: sk_test_51ABCDEF12345678901234567890\n\
     };
 
     let (findings, _) = run_scan(&options, None).expect("run_scan should succeed");
-    assert!(!findings.is_empty(), "Should find API tokens");
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding.finding_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Stripe API Key"],
+        "Should find API tokens"
+    );
 
     fs::remove_file(test_file).expect("Cleanup");
 }
@@ -170,7 +196,19 @@ AZURE_STORAGE=DefaultEndpointsProtocol=https;AccountName=examplestore;
     };
 
     let (findings, _) = run_scan(&options, None).expect("run_scan should succeed");
-    assert!(!findings.is_empty(), "Should find cloud credentials");
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding.finding_type.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "AWS Access Key",
+            "Generic Key/Secret",
+            "Base64 Encoded String",
+            "Generic Key/Secret",
+        ],
+        "Should find cloud credentials"
+    );
 
     fs::remove_file(test_file).expect("Cleanup");
 }
@@ -196,7 +234,23 @@ b3BlbnNzaC1ldi0xLjAAABgQDQD2FGB3V2t4=\n\
     };
 
     let (findings, _) = run_scan(&options, None).expect("run_scan should succeed");
-    assert!(!findings.is_empty(), "Should find private keys");
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding.finding_type.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "SSH Private Key",
+            // PrivateKeyDetector and PrivateKeyContentDetector report the
+            // same block; the overlap collapses to one finding.
+            "Private Key Content",
+            "Base64 Encoded String",
+            "SSH Private Key",
+            "Private Key Content",
+            "Base64 Encoded String",
+        ],
+        "Should find private keys"
+    );
 
     fs::remove_file(test_file).expect("Cleanup");
 }
@@ -404,8 +458,16 @@ fn test_multiple_files_scan() {
     };
 
     let (findings, metadata) = run_scan(&options, None).expect("run_scan should succeed");
-    assert!(
-        !findings.is_empty(),
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| (finding.file_path.as_str(), finding.finding_type.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            // The password line is matched by both PasswordDetector and
+            // GenericKeyValueDetector; the overlap collapses to one finding.
+            (test_file2.to_str().unwrap(), "Generic Key/Secret"),
+        ],
         "Should find secrets in multiple files"
     );
     assert_eq!(metadata.files_scanned, 2, "Should scan 2 files");
@@ -1001,6 +1063,99 @@ fn test_git_history_does_not_execute_textconv_helpers() -> Result<(), String> {
     Ok(())
 }
 
+#[test]
+fn test_git_history_scans_merge_commits() -> Result<(), String> {
+    require_git();
+
+    let repo_dir = unique_temp_dir("git_history_merge_commit");
+    let _ = fs::remove_dir_all(&repo_dir);
+    init_git_repo(&repo_dir)?;
+    commit_file(&repo_dir, "data.txt", "value = 1\n", "base")?;
+
+    let current_branch = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&repo_dir)
+        .output()
+        .map_err(|error| format!("read branch: {error}"))?;
+    let base_branch = String::from_utf8_lossy(&current_branch.stdout)
+        .trim()
+        .to_string();
+
+    let status = Command::new("git")
+        .args(["checkout", "--quiet", "-b", "feature"])
+        .current_dir(&repo_dir)
+        .status()
+        .map_err(|error| format!("checkout feature: {error}"))?;
+    if !status.success() {
+        return Err("git checkout -b feature failed".to_string());
+    }
+    commit_file(&repo_dir, "data.txt", "value = feature\n", "feature")?;
+
+    let status = Command::new("git")
+        .args(["checkout", "--quiet", &base_branch])
+        .current_dir(&repo_dir)
+        .status()
+        .map_err(|error| format!("checkout {base_branch}: {error}"))?;
+    if !status.success() {
+        return Err("git checkout base failed".to_string());
+    }
+    commit_file(&repo_dir, "data.txt", "value = base\n", "conflicting")?;
+
+    // Merging conflicts. The resolution introduces the secret, so it exists
+    // only in the merge commit's diff.
+    let status = Command::new("git")
+        .args(["merge", "--quiet", "feature"])
+        .current_dir(&repo_dir)
+        .status()
+        .map_err(|error| format!("git merge: {error}"))?;
+    if status.success() {
+        return Err("the fixture merge was expected to conflict".to_string());
+    }
+
+    fs::write(
+        repo_dir.join("data.txt"),
+        "value = resolved\nAWS Key: AKIAABCDEFGHIJKLMNOP\n",
+    )
+    .map_err(|error| format!("write resolution: {error}"))?;
+
+    let status = Command::new("git")
+        .args(["add", "data.txt"])
+        .current_dir(&repo_dir)
+        .status()
+        .map_err(|error| format!("git add resolution: {error}"))?;
+    if !status.success() {
+        return Err("git add resolution failed".to_string());
+    }
+
+    let status = Command::new("git")
+        .args(["commit", "--quiet", "--no-verify", "-m", "evil merge"])
+        .current_dir(&repo_dir)
+        .status()
+        .map_err(|error| format!("git commit merge: {error}"))?;
+    if !status.success() {
+        return Err("git commit merge failed".to_string());
+    }
+
+    let output = run_git_history_scan(&repo_dir, &["--verbose"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        matches!(output.status.code(), Some(1)),
+        "a secret introduced in a merge commit must be found\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("data.txt"),
+        "the finding must name the resolved file\nstdout:\n{}",
+        stdout
+    );
+
+    let _ = fs::remove_dir_all(&repo_dir);
+    Ok(())
+}
+
 fn run_staged_scan(current_dir: &Path, extra_args: &[&str]) -> Result<Output, String> {
     Command::new(env!("CARGO_BIN_EXE_key-watch"))
         .args(["scan", "--staged"])
@@ -1123,6 +1278,43 @@ fn test_staged_scan_reports_added_secret_with_real_path_and_line() -> Result<(),
     assert!(
         stdout.contains("\"line_number\": 3"),
         "findings must carry the post-image line number\nstdout:\n{}",
+        stdout
+    );
+
+    let _ = fs::remove_dir_all(&repo_dir);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_staged_scan_reads_diff_suppressed_blob_by_object_id() -> Result<(), String> {
+    require_git();
+
+    let repo_dir = unique_temp_dir("staged_object_id");
+    let _ = fs::remove_dir_all(&repo_dir);
+    init_git_repo(&repo_dir)?;
+    commit_file(
+        &repo_dir,
+        ".gitattributes",
+        "0:config -diff\n",
+        "attributes",
+    )?;
+    commit_file(&repo_dir, "config", "clean\n", "decoy")?;
+    stage_file(&repo_dir, "0:config", "AWS Key: AKIAABCDEFGHIJKLMNOP\n")?;
+
+    let output = run_staged_scan(&repo_dir, &["--verbose"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        matches!(output.status.code(), Some(1)),
+        "a secret in a diff-suppressed file must be read by object ID\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("\"file_path\": \"0:config\""),
+        "the finding must name the staged file\nstdout:\n{}",
         stdout
     );
 
@@ -2306,6 +2498,103 @@ fn test_stdin_with_nul_bytes_scans_through() -> Result<(), String> {
         Some(1),
         "the secret after the NUL line must be found, got:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn test_overlapping_detectors_collapse_to_one_finding() -> Result<(), String> {
+    // StripeWebhookSecretDetector and WebhookSecretDetector both match a
+    // `whsec_` token on the same line with identical matched text. One secret
+    // must collapse to one finding, and the deterministic tie-break keeps the
+    // lexicographically smaller detector name when severities are equal.
+    let dir = unique_temp_dir("dedupe_whsec");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Compose the token at runtime so no push-protection-style literal lands
+    // in the repository; both detectors still see one contiguous token.
+    let token = format!("whsec_{}", "abcdefghijklmnopqrstuvwxyz012345");
+    fs::write(
+        dir.join("webhook.conf"),
+        format!("tokens: {token} and AKIAABCDEFGHIJKLMNOP\n"),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let options = ScanArgs {
+        paths: vec![dir.to_str().ok_or("temp path should be UTF-8")?.to_string()],
+        no_baseline_discovery: true,
+        ..Default::default()
+    };
+
+    let (findings, _) = run_scan(&options, None).expect("run_scan should succeed");
+
+    let webhook_findings: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding.matched_content == token)
+        .collect();
+    assert_eq!(
+        webhook_findings.len(),
+        1,
+        "two detectors matching the same text must collapse to one finding: {findings:?}"
+    );
+    assert_eq!(
+        webhook_findings[0].detector_name, "StripeWebhookSecretDetector",
+        "on equal severity the lexicographically smaller detector name wins"
+    );
+
+    let aws_findings: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding.matched_content == "AKIAABCDEFGHIJKLMNOP")
+        .collect();
+    assert_eq!(
+        aws_findings.len(),
+        1,
+        "a different secret on the same line must keep its own finding: {findings:?}"
+    );
+
+    fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[test]
+fn test_scan_reports_are_byte_identical_across_runs() -> Result<(), String> {
+    // Detector iteration and rayon scheduling must not leak into the report:
+    // the same tree scanned twice produces the same bytes.
+    let dir = unique_temp_dir("deterministic_report");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(
+        dir.join("a.conf"),
+        "aws_access_key_id = AKIAABCDEFGHIJKLMNOP\npassword = 'mySecretPassword'\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        dir.join("b.conf"),
+        "xoxb-abcdefghijklmnop-qrstuvwxyz-123456789012\n",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let options = ScanArgs {
+        paths: vec![dir.to_str().expect("temp path should be UTF-8").to_string()],
+        no_baseline_discovery: true,
+        ..Default::default()
+    };
+
+    let (findings_first, metadata_first) =
+        run_scan(&options, None).expect("first run_scan should succeed");
+    let (findings_second, metadata_second) =
+        run_scan(&options, None).expect("second run_scan should succeed");
+
+    let report_first = create_report(findings_first, metadata_first, "0.0s".to_string(), false)
+        .expect("first report should serialize");
+    let report_second = create_report(findings_second, metadata_second, "0.0s".to_string(), false)
+        .expect("second report should serialize");
+
+    assert_eq!(
+        report_first, report_second,
+        "scanning the same fixture twice must produce byte-identical reports"
     );
 
     let _ = fs::remove_dir_all(&dir);

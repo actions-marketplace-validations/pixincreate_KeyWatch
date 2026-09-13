@@ -124,7 +124,10 @@ pub struct ScanArgs {
     /// Disable automatic config discovery (an explicit --config still loads)
     #[arg(long, default_value_t = false)]
     pub no_config_discovery: bool,
-
+    /// Exit 1 when any scanned file could not be read (Strict exit mode only;
+    /// not applied by --update-baseline)
+    #[arg(long, default_value_t = false)]
+    pub fail_on_unscannable: bool,
     /// Output format for the report (json or sarif)
     #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     pub format: OutputFormat,
@@ -252,6 +255,7 @@ pub enum Shell {
 
 #[derive(ValueEnum, Clone, Debug, Default, PartialEq, Eq)]
 pub enum ExitMode {
+    /// Never fails: findings are reported but the exit code stays 0.
     Always,
     Critical,
     #[default]

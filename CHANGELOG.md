@@ -9,12 +9,14 @@ All notable changes to this project will be documented in this file.
 - `scan --staged` scans only the lines a commit adds
 - Baselines are auto-discovered from `.keywatch-baseline.json`; `--no-baseline-discovery` opts out
 - `update-baseline` workflow regenerates the baseline via a pull request
+- `scan --fail-on-unscannable` fails a strict scan when a file could not be read; the pre-commit hook passes it so an unscannable staged file cannot pass silently
 
 ### Changed
 
 - Pre-commit hooks scan the staged diff instead of whole files
 - Config discovery searches parent directories up to the repository root
 - Hook messages abbreviate the home directory as `~`
+- Findings for the same file, line and matched text collapse to the highest severity across all scan modes, so overlapping detectors report a secret once
 
 ### Added
 
@@ -65,6 +67,13 @@ All notable changes to this project will be documented in this file.
 - `--update-baseline` refreshes the recorded line numbers of entries it already knows, and saved baselines end with a newline
 - SARIF report property order is deterministic
 - Piping output to a closed reader no longer panics, including `hook install` and `init`; hook commands now report real output failures instead of discarding them
+- Trusted scans (`--no-config-discovery`) no longer read detector configuration from environment-derived locations (`$XDG_CONFIG_HOME`, `$HOME`, the executable directory), so a redirected home directory cannot replace the built-in detector set
+- Staged blobs are resolved to object IDs and read with `git cat-file blob <oid>` instead of `:<path>`, so a file whose name resembles a git stage path (`0:config`) can no longer substitute another file's content
+- `scan --git-history` reads merge commits (`--diff-merges=first-parent`), so a secret introduced while resolving a conflict is reported
+- Files that fail to open or read are counted as `unscannable` instead of being silently skipped
+- Ten detectors that matched the wrong shape or nothing at all (`SupabaseServiceRoleKey`, `TerraformCloudToken`, `AzureStorageKey`, `DockerHubToken`, `CircleCIToken`, `DiscordToken`, `NetlifyToken`, `CodecovToken`, `AdyenAPIKey`, `RazorpayKey`) now follow the documented token format, each pinned by a real-format fixture test; the two that matched only non-secrets were removed
+- `Email`, `PhoneNumber`, `IPAddress`, `TwilioAPIKey` and `MailgunAPIKey` no longer suppress or match unintended text: the example-domain allowlist is anchored, only the reserved `555-01xx` numbers are ignored, every IPv4 octet is validated, and embedded vendor prefixes require word boundaries
+- Entropy and validators run on the captured value rather than the whole match, so `api_key = "aaaaaaaaaa"` is no longer reported; `GCPServiceAccountKey` requires a `private_key` field and `MasterAPIKey`, `AzureDevOpsPAT`, `KimiMoonshotAPIKey` and `CertificateDetector` severities now reflect credential impact
 
 ### Performance
 
@@ -107,7 +116,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- `get_severity_counts()` now returns 4-tuple (Critical, High, Medium, Low) instead of 3-tuple
+- `get_severity_counts()` now returns a `SeverityCounts` struct with `critical`, `high`, `medium`, and `low` fields instead of a tuple
 - `run_scan()` accepts optional `config` parameter for merging user configuration
 - Simplified distribution to a single shipped binary: `key-watch`
 - Git hook installation now supports first-class global hooks via `core.hooksPath`

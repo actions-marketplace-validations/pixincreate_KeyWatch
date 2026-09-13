@@ -3,7 +3,7 @@ mod error;
 pub use error::DetectorInitError;
 
 use crate::report::{ParseSeverityError, Severity};
-use regex::Regex;
+use regex::{Captures, Regex};
 use serde::Deserialize;
 use std::{borrow::Cow, fs, str::FromStr};
 use thiserror::Error;
@@ -50,6 +50,10 @@ pub enum ContentValidator {
     /// Aadhaar numbers carry a Verhoeff check digit. Without it, every
     /// 12-digit run (the tail of a UUID, a numeric id) reports HIGH.
     Verhoeff,
+    /// Supabase JWTs carry the role in the base64url payload, so the claim's
+    /// encoded bytes shift with the surrounding fields. Decode the payload and
+    /// read the claim instead of matching one fixed base64 fragment.
+    SupabaseServiceRole,
 }
 
 impl FromStr for ContentValidator {
@@ -59,6 +63,7 @@ impl FromStr for ContentValidator {
         match value.trim().to_lowercase().as_str() {
             "luhn" => Ok(Self::Luhn),
             "verhoeff" => Ok(Self::Verhoeff),
+            "supabase-service-role" => Ok(Self::SupabaseServiceRole),
             other => Err(ParseValidatorError {
                 value: other.to_string(),
             }),
@@ -115,7 +120,6 @@ fn passes_verhoeff(matched: &str) -> bool {
     check == 0
 }
 
-/// Luhn checksum, ignoring embedded separators.
 #[cfg(test)]
 mod verhoeff_tests {
     use super::passes_verhoeff;
@@ -252,8 +256,59 @@ impl Detector {
         match self.validator {
             Some(ContentValidator::Luhn) => passes_luhn(matched),
             Some(ContentValidator::Verhoeff) => passes_verhoeff(matched),
+            Some(ContentValidator::SupabaseServiceRole) => {
+                Self::passes_supabase_service_role(matched)
+            }
             None => true,
         }
+    }
+
+    /// Whether a Supabase JWT's payload claims the `service_role`.
+    ///
+    /// The claim is JSON inside the base64url payload segment, so its encoded
+    /// bytes shift with the surrounding fields (a 20-character project ref puts
+    /// `service_role` out of phase with the literal `c2VydmljZV9yb2xl`). Decode
+    /// the segment and read the claim instead.
+    fn passes_supabase_service_role(matched: &str) -> bool {
+        static ROLE_CLAIM: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#""role"\s*:\s*"service_role""#).expect("role claim pattern is valid")
+        });
+
+        let Some(payload) = matched.split('.').nth(1) else {
+            return false;
+        };
+        let Some(decoded) = Self::decode_base64url(payload) else {
+            return false;
+        };
+        let Ok(payload) = String::from_utf8(decoded) else {
+            return false;
+        };
+        ROLE_CLAIM.is_match(&payload)
+    }
+
+    /// Decodes unpadded base64url. Returns `None` for any character outside the
+    /// alphabet, so malformed candidates do not validate.
+    fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+        let mut decoded = Vec::with_capacity(input.len() * 3 / 4);
+        let mut buffer: u32 = 0;
+        let mut bits: u32 = 0;
+        for byte in input.bytes() {
+            if byte == b'=' {
+                continue;
+            }
+            let value = ALPHABET.iter().position(|candidate| *candidate == byte)? as u32;
+            buffer = (buffer << 6) | value;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                decoded.push((buffer >> bits) as u8);
+                buffer &= (1 << bits) - 1;
+            }
+        }
+        Some(decoded)
     }
 
     /// `lowercase_content` must already be lowercased. Keywords are stored
@@ -272,12 +327,37 @@ impl Detector {
     /// and the structural validator. The scanner loops and the tests share
     /// this so the accept chain exists in exactly one place.
     pub fn accepts_match(&self, matched: &str) -> bool {
+        self.accepts_parts(matched, matched)
+    }
+
+    /// Captures-aware accept gate for a pattern with capture groups: the
+    /// allowlist encodes key-name context and always sees the whole match,
+    /// while entropy and the validator see the captured value. The value is
+    /// the last group that participated, which is group 1 for the common
+    /// single-group value pattern; a keyword alternation may add an earlier
+    /// group, and a key name such as `api_key` must not supply the entropy
+    /// its value lacks. Without a participating group, both checks fall back
+    /// to the whole match.
+    pub fn accepts_captures(&self, captures: &Captures<'_>) -> bool {
+        let Some(matched) = captures.get(0) else {
+            return false;
+        };
+        match (1..captures.len())
+            .rev()
+            .find_map(|index| captures.get(index))
+        {
+            Some(value) => self.accepts_parts(matched.as_str(), value.as_str()),
+            None => self.accepts_match(matched.as_str()),
+        }
+    }
+
+    fn accepts_parts(&self, matched: &str, value: &str) -> bool {
         !self
             .allowlist
             .iter()
             .any(|pattern| pattern.is_match(matched))
-            && self.has_sufficient_entropy(matched)
-            && self.passes_validation(matched)
+            && self.has_sufficient_entropy(value)
+            && self.passes_validation(value)
     }
 
     /// Whether the pattern carries the dot-matches-newline flag anywhere —
@@ -415,6 +495,7 @@ fn find_detectors_config(
                 || untrusted_roots.is_empty()
                 || !untrusted_roots.iter().any(|root| is_within(path, root))
         })
+        .filter(|path| !crate::utils::is_world_writable(path))
         .or_else(|| {
             if !include_repository_config {
                 return None;
@@ -423,12 +504,25 @@ fn find_detectors_config(
             let repository_config = std::path::PathBuf::from(DETECTORS_FILE_NAME);
             repository_config.exists().then_some(repository_config)
         })
+        // Trusted mode uses the embedded detector set. A repository can
+        // redirect HOME or XDG_CONFIG_HOME (.envrc, devcontainer) and drop a
+        // detectors.toml into the redirected location, which would silently
+        // disable the hook; the binary directory is skipped for the same
+        // reason. KEYWATCH_CONFIG_PATH above remains the operator channel.
         .or_else(|| {
+            if !include_repository_config {
+                return None;
+            }
+
             dirs::config_dir()
                 .map(|config_directory| config_directory.join("keywatch").join(DETECTORS_FILE_NAME))
                 .filter(|path| path.exists())
         })
         .or_else(|| {
+            if !include_repository_config {
+                return None;
+            }
+
             std::env::current_exe()
                 .ok()
                 .and_then(|executable_path| {

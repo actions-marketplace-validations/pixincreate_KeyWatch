@@ -4,9 +4,14 @@
 
 use crate::cli::ScanArgs;
 use crate::config::KeywatchConfig;
-use crate::detector::{initialize_detectors, initialize_trusted_detectors, untrusted_root};
+use crate::detector::{
+    Detector, initialize_detectors, initialize_trusted_detectors, untrusted_root,
+};
 use crate::report::{Finding, ScanMetadata};
+use glob::Pattern;
 use rayon::prelude::*;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -50,6 +55,58 @@ pub fn run_scan(
     args: &ScanArgs,
     config: Option<&KeywatchConfig>,
 ) -> Result<(Vec<Finding>, ScanMetadata), ScannerError> {
+    let detectors = resolve_detectors(args, config)?;
+    // A pattern carrying the dot-matches-newline flag anywhere — `(?s)` or
+    // the grouped `(?s:...)` form — spans lines and must run per-chunk, not
+    // per-line, or multiline secrets slip past it.
+    let (multiline_detectors, line_detectors): (Vec<_>, Vec<_>) = detectors
+        .iter()
+        .partition(|detector| detector.is_multiline());
+
+    // Resolved once: every scan mode must skip the baseline file itself.
+    let excluded_baseline = baseline_exclusion(args);
+
+    let (findings, metadata) = if args.git_history {
+        scan_git_history(
+            args,
+            config,
+            excluded_baseline.as_ref(),
+            &multiline_detectors,
+            &line_detectors,
+        )?
+    } else if args.staged {
+        scan_staged(
+            args,
+            config,
+            excluded_baseline.as_ref(),
+            &multiline_detectors,
+            &line_detectors,
+        )?
+    } else if args.stdin {
+        scan_stdin(&multiline_detectors, &line_detectors)?
+    } else {
+        scan_filesystem(
+            args,
+            config,
+            excluded_baseline.as_ref(),
+            &multiline_detectors,
+            &line_detectors,
+        )?
+    };
+
+    // Every mode funnels through here, so deduplication and the canonical
+    // order hold for reports, baselines and exit codes alike.
+    let mut findings = dedupe_findings(findings);
+    sort_findings(&mut findings);
+    Ok((findings, metadata))
+}
+
+/// Builds the detector set for this scan and applies user configuration on
+/// top. Trusted mode ignores repository-supplied detector files.
+fn resolve_detectors(
+    args: &ScanArgs,
+    config: Option<&KeywatchConfig>,
+) -> Result<Vec<Detector>, ScannerError> {
     let mut detectors = if args.no_config_discovery {
         initialize_trusted_detectors(&untrusted_roots(args))
     } else {
@@ -61,141 +118,198 @@ pub fn run_scan(
         cfg.apply_to(&mut detectors)
             .map_err(|source| ScannerError::Config { source })?;
     }
-    // A pattern carrying the dot-matches-newline flag anywhere — `(?s)` or
-    // the grouped `(?s:...)` form — spans lines and must run per-chunk, not
-    // per-line, or multiline secrets slip past it.
-    let (multiline_detectors, line_detectors): (Vec<_>, Vec<_>) = detectors
-        .iter()
-        .partition(|detector| detector.is_multiline());
 
-    // Resolved once: every scan mode must skip the baseline file itself.
-    let excluded_baseline = baseline_exclusion(args);
+    Ok(detectors)
+}
 
-    if args.git_history {
-        let git_root = args
-            .paths
-            .first()
-            .map(Path::new)
-            .unwrap_or_else(|| Path::new("."));
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // History diffs are repository-root-relative; the same root anchors
-        // baseline self-exclusion.
-        let repo_root = git_repo_root(&cwd.join(git_root)).unwrap_or_else(|| cwd.join(git_root));
-        let mut command = std::process::Command::new("git");
-        command
-            .current_dir(git_root)
-            .args(GIT_DIFF_FRAMING_ARGS)
-            .args([
-                "log",
-                "-p",
-                "-U0",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-            ]);
-
-        // `git log -p` emits the same diff framing as `git diff --cached`, so
-        // history reuses the staged parser. That gives it real file paths
-        // instead of a synthetic "<git-history>" key — which no baseline
-        // entry could ever match — plus --exclude and baseline-file
-        // exclusion, none of which this mode previously applied.
-        let exclude_patterns = compile_exclude_patterns(args, config)?;
-        let history = scan_git_output(
-            command,
-            ScannerError::GitLogNonZero,
-            |reader| {
-                scan_staged_diff(
-                    reader,
-                    &exclude_patterns,
-                    excluded_baseline.as_ref(),
-                    &repo_root,
-                    &multiline_detectors,
-                    &line_detectors,
-                )
-            },
-            |source| ScannerError::RunGitLog { source },
-        )?;
-
-        let mut metadata = history.metadata;
-        // Blobs are only re-readable from the index, not from history, so a
-        // git-rendered binary in history is unscannable rather than excluded.
-        metadata.unscannable_files = history.unscannable_from_diff;
-
-        let mut findings = history.findings;
-        sort_findings(&mut findings);
-        return Ok((findings, metadata));
-    }
-
-    if args.staged {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let repo_root = git_repo_root(&cwd).unwrap_or(cwd);
-        let exclude_patterns = compile_exclude_patterns(args, config)?;
-        let mut command = std::process::Command::new("git");
-        command.args(GIT_DIFF_FRAMING_ARGS).args([
-            "diff",
-            "--cached",
+/// Scans `git log -p` output. `git log -p` emits the same diff framing as
+/// `git diff --cached`, so history reuses the staged parser. That gives it
+/// real file paths instead of a synthetic "<git-history>" key — which no
+/// baseline entry could ever match — plus --exclude and baseline-file
+/// exclusion, none of which this mode previously applied.
+fn scan_git_history(
+    args: &ScanArgs,
+    config: Option<&KeywatchConfig>,
+    excluded_baseline: Option<&PathBuf>,
+    multiline_detectors: &[&Detector],
+    line_detectors: &[&Detector],
+) -> Result<(Vec<Finding>, ScanMetadata), ScannerError> {
+    let git_root = args
+        .paths
+        .first()
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // History diffs are repository-root-relative; the same root anchors
+    // baseline self-exclusion.
+    let repo_root = git_repo_root(&cwd.join(git_root)).unwrap_or_else(|| cwd.join(git_root));
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(git_root)
+        .args(GIT_DIFF_FRAMING_ARGS)
+        .args([
+            "log",
+            "-p",
             "-U0",
+            "--diff-merges=first-parent",
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
-            "--",
         ]);
-        command.args(&args.paths);
 
-        let staged = scan_git_output(
-            command,
-            ScannerError::GitDiffNonZero,
-            |reader| {
-                scan_staged_diff(
-                    reader,
-                    &exclude_patterns,
-                    excluded_baseline.as_ref(),
-                    &repo_root,
-                    &multiline_detectors,
-                    &line_detectors,
-                )
-            },
-            |source| ScannerError::RunGitDiff { source },
-        )?;
+    let exclude_patterns = compile_exclude_patterns(args, config)?;
+    let history = scan_git_output(
+        command,
+        ScannerError::GitLogNonZero,
+        |reader| {
+            scan_staged_diff(
+                reader,
+                &exclude_patterns,
+                excluded_baseline,
+                &repo_root,
+                multiline_detectors,
+                line_detectors,
+            )
+        },
+        |source| ScannerError::RunGitLog { source },
+    )?;
 
-        let StagedScan {
-            mut findings,
-            mut metadata,
-            unscannable_from_diff,
-        } = staged;
+    let mut metadata = history.metadata;
+    // Blobs are only re-readable from the index, not from history, so a
+    // git-rendered binary in history is unscannable rather than excluded.
+    metadata.unscannable_files = history.unscannable_from_diff;
 
-        let (blob_findings, blob_lines, skipped) = scan_index_blobs(
-            &unscannable_from_diff,
-            &multiline_detectors,
-            &line_detectors,
-        )?;
-        findings.extend(blob_findings);
-        metadata.total_lines += blob_lines;
-        metadata.files_scanned += unscannable_from_diff.len() - skipped.len();
-        metadata.unscannable_files.extend(skipped);
+    let mut findings = history.findings;
+    sort_findings(&mut findings);
+    Ok((findings, metadata))
+}
 
-        sort_findings(&mut findings);
+/// Scans the staged diff, then reads the staged blob of every path git
+/// rendered as binary so a `-diff` gitattribute cannot hide a staged secret.
+fn scan_staged(
+    args: &ScanArgs,
+    config: Option<&KeywatchConfig>,
+    excluded_baseline: Option<&PathBuf>,
+    multiline_detectors: &[&Detector],
+    line_detectors: &[&Detector],
+) -> Result<(Vec<Finding>, ScanMetadata), ScannerError> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repo_root = git_repo_root(&cwd).unwrap_or(cwd);
+    let exclude_patterns = compile_exclude_patterns(args, config)?;
+    let mut command = std::process::Command::new("git");
+    command.args(GIT_DIFF_FRAMING_ARGS).args([
+        "diff",
+        "--cached",
+        "-U0",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--",
+    ]);
+    command.args(&args.paths);
 
-        return Ok((findings, metadata));
+    let staged = scan_git_output(
+        command,
+        ScannerError::GitDiffNonZero,
+        |reader| {
+            scan_staged_diff(
+                reader,
+                &exclude_patterns,
+                excluded_baseline,
+                &repo_root,
+                multiline_detectors,
+                line_detectors,
+            )
+        },
+        |source| ScannerError::RunGitDiff { source },
+    )?;
+
+    let StagedScan {
+        mut findings,
+        mut metadata,
+        unscannable_from_diff,
+    } = staged;
+
+    let (blob_findings, blob_lines, skipped) =
+        scan_index_blobs(&unscannable_from_diff, multiline_detectors, line_detectors)?;
+    findings.extend(blob_findings);
+    metadata.total_lines += blob_lines;
+    metadata.files_scanned += unscannable_from_diff.len() - skipped.len();
+    metadata.unscannable_files.extend(skipped);
+
+    sort_findings(&mut findings);
+
+    Ok((findings, metadata))
+}
+
+fn scan_stdin(
+    multiline_detectors: &[&Detector],
+    line_detectors: &[&Detector],
+) -> Result<(Vec<Finding>, ScanMetadata), ScannerError> {
+    let stdin = std::io::stdin();
+    let reader = BufReader::new(stdin);
+    let (findings, total_lines) =
+        scan_stream(reader, "<stdin>", multiline_detectors, line_detectors)?;
+
+    let metadata = ScanMetadata {
+        files_scanned: 1,
+        total_lines,
+        excluded_files: Vec::new(),
+        unscannable_files: Vec::new(),
+        suppressed_by_baseline: 0,
+    };
+
+    Ok((findings, metadata))
+}
+
+/// One scanned path's contribution to the report.
+struct FileOutcome {
+    findings: Vec<Finding>,
+    lines_seen: usize,
+    scanned: bool,
+    excluded: Option<String>,
+    unscannable: Option<String>,
+}
+
+impl FileOutcome {
+    fn skipped_but_reported(path: String) -> Self {
+        Self {
+            findings: Vec::new(),
+            lines_seen: 0,
+            scanned: false,
+            excluded: Some(path),
+            unscannable: None,
+        }
     }
 
-    if args.stdin {
-        let stdin = std::io::stdin();
-        let reader = BufReader::new(stdin);
-        let (findings, total_lines) =
-            scan_stream(reader, "<stdin>", &multiline_detectors, &line_detectors)?;
-
-        let metadata = ScanMetadata {
-            files_scanned: 1,
-            total_lines,
-            excluded_files: Vec::new(),
-            unscannable_files: Vec::new(),
-            suppressed_by_baseline: 0,
-        };
-
-        return Ok((findings, metadata));
+    fn ignored() -> Self {
+        Self {
+            findings: Vec::new(),
+            lines_seen: 0,
+            scanned: false,
+            excluded: None,
+            unscannable: None,
+        }
     }
 
+    fn unreadable(path: String) -> Self {
+        Self {
+            findings: Vec::new(),
+            lines_seen: 0,
+            scanned: false,
+            excluded: None,
+            unscannable: Some(path),
+        }
+    }
+}
+
+fn scan_filesystem(
+    args: &ScanArgs,
+    config: Option<&KeywatchConfig>,
+    excluded_baseline: Option<&PathBuf>,
+    multiline_detectors: &[&Detector],
+    line_detectors: &[&Detector],
+) -> Result<(Vec<Finding>, ScanMetadata), ScannerError> {
     let mut target_paths: Vec<ScanTarget> = Vec::new();
 
     for path_str in &args.paths {
@@ -230,99 +344,95 @@ pub fn run_scan(
     let unique_paths: Vec<_> = unique_paths.into_iter().collect();
 
     let exclude_patterns = compile_exclude_patterns(args, config)?;
-    let line_scan_context = LineScanContext::new(&line_detectors);
+    let line_scan_context = LineScanContext::new(line_detectors);
     let scan_base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    /// One scanned path's contribution to the report.
-    struct FileOutcome {
-        findings: Vec<Finding>,
-        lines_seen: usize,
-        scanned: bool,
-        excluded: Option<String>,
-        unscannable: Option<String>,
-    }
-
-    impl FileOutcome {
-        fn skipped_but_reported(path: String) -> Self {
-            Self {
-                findings: Vec::new(),
-                lines_seen: 0,
-                scanned: false,
-                excluded: Some(path),
-                unscannable: None,
-            }
-        }
-
-        fn ignored() -> Self {
-            Self {
-                findings: Vec::new(),
-                lines_seen: 0,
-                scanned: false,
-                excluded: None,
-                unscannable: None,
-            }
-        }
-    }
 
     let results: Vec<FileOutcome> = unique_paths
         .into_par_iter()
         .map(|(path, roots)| {
-            if path_has_git_dir(Path::new(&path)) {
-                return FileOutcome::skipped_but_reported(path);
-            }
-
-            if matches_exclude_patterns(&path, &roots, &exclude_patterns)
-                || is_baseline_file(&path, &scan_base_dir, excluded_baseline.as_ref())
-                || is_default_excluded_file(&path)
-            {
-                return FileOutcome::skipped_but_reported(path);
-            }
-
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(_) => return FileOutcome::ignored(),
-            };
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() || !file_type.is_file() {
-                return FileOutcome::ignored();
-            }
-
-            // Streamed: memory stays bounded for huge files, invalid UTF-8
-            // decodes lossily instead of skipping the file, and a NUL byte
-            // marks the file binary (reported as unscannable).
-            let mut reader = match fs::File::open(&path) {
-                Ok(file) => BufReader::new(file),
-                Err(_) => return FileOutcome::ignored(),
-            };
-            let scanned = match scan_file_stream(
-                &mut reader,
+            scan_one_path(
                 &path,
-                &multiline_detectors,
+                &roots,
+                &exclude_patterns,
+                excluded_baseline,
+                &scan_base_dir,
+                multiline_detectors,
                 &line_scan_context,
-            ) {
-                Ok(scanned) => scanned,
-                Err(_) => return FileOutcome::ignored(),
-            };
-            if scanned.binary {
-                return FileOutcome {
-                    findings: Vec::new(),
-                    lines_seen: 0,
-                    scanned: false,
-                    excluded: None,
-                    unscannable: Some(path),
-                };
-            }
-
-            FileOutcome {
-                findings: scanned.findings,
-                lines_seen: scanned.total_lines,
-                scanned: true,
-                excluded: None,
-                unscannable: None,
-            }
+            )
         })
         .collect();
 
+    Ok(aggregate_file_outcomes(results))
+}
+
+/// Scans a single path and classifies the outcome. Streamed: memory stays
+/// bounded for huge files, invalid UTF-8 decodes lossily instead of skipping
+/// the file, and a NUL byte marks the file binary (reported as unscannable).
+fn scan_one_path(
+    path: &str,
+    roots: &[Option<String>],
+    exclude_patterns: &[Pattern],
+    excluded_baseline: Option<&PathBuf>,
+    scan_base_dir: &Path,
+    multiline_detectors: &[&Detector],
+    line_scan_context: &LineScanContext<'_>,
+) -> FileOutcome {
+    if path_has_git_dir(Path::new(path)) {
+        return FileOutcome::skipped_but_reported(path.to_string());
+    }
+
+    if matches_exclude_patterns(path, roots, exclude_patterns)
+        || is_baseline_file(path, scan_base_dir, excluded_baseline)
+        || is_default_excluded_file(path)
+    {
+        return FileOutcome::skipped_but_reported(path.to_string());
+    }
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return FileOutcome::ignored();
+        }
+        Err(_) => return FileOutcome::unreadable(path.to_string()),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || !file_type.is_file() {
+        return FileOutcome::ignored();
+    }
+
+    let mut reader = match fs::File::open(path) {
+        Ok(file) => BufReader::new(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return FileOutcome::ignored();
+        }
+        Err(_) => return FileOutcome::unreadable(path.to_string()),
+    };
+    let scanned = match scan_file_stream(&mut reader, path, multiline_detectors, line_scan_context)
+    {
+        Ok(scanned) => scanned,
+        Err(_) => return FileOutcome::unreadable(path.to_string()),
+    };
+    if scanned.binary {
+        return FileOutcome {
+            findings: Vec::new(),
+            lines_seen: 0,
+            scanned: false,
+            excluded: None,
+            unscannable: Some(path.to_string()),
+        };
+    }
+
+    FileOutcome {
+        findings: scanned.findings,
+        lines_seen: scanned.total_lines,
+        scanned: true,
+        excluded: None,
+        unscannable: None,
+    }
+}
+
+/// Folds per-path outcomes into the report's finding list and metadata.
+fn aggregate_file_outcomes(results: Vec<FileOutcome>) -> (Vec<Finding>, ScanMetadata) {
     let mut findings = Vec::new();
     let mut files_scanned = 0;
     let mut total_lines = 0;
@@ -353,7 +463,7 @@ pub fn run_scan(
         suppressed_by_baseline: 0,
     };
 
-    Ok((findings, metadata))
+    (findings, metadata)
 }
 
 /// Directories the scanned tree's owner may control, handed to trusted
@@ -362,6 +472,8 @@ pub fn run_scan(
 /// tree, so that tree's root is untrusted; file scans distrust everything at
 /// or below each target's enclosing repository root. The current directory is
 /// always included: a repository can reach the environment through
+/// `.envrc`/direnv or a devcontainer, so where the process runs is never
+/// trusted.
 fn untrusted_roots(args: &ScanArgs) -> Vec<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut roots = vec![cwd.clone()];
@@ -399,6 +511,35 @@ fn git_repo_root(dir: &Path) -> Option<PathBuf> {
     (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
+/// Collapses findings that share a file, line and matched text: overlapping
+/// detectors match the same secret, and one secret must not be reported once
+/// per detector. On collision the smaller severity wins (under the derived
+/// `Ord`, `Critical` is smallest and most severe); on equal severity the
+/// lexicographically smaller detector name wins, so the pick is deterministic.
+fn dedupe_findings(findings: Vec<Finding>) -> Vec<Finding> {
+    let mut by_site: BTreeMap<(String, usize, String), Finding> = BTreeMap::new();
+    for finding in findings {
+        let key = (
+            finding.file_path.clone(),
+            finding.line_number,
+            finding.matched_content.clone(),
+        );
+        match by_site.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(finding);
+            }
+            Entry::Occupied(mut slot) => {
+                let kept = slot.get();
+                if (finding.severity, &finding.detector_name) < (kept.severity, &kept.detector_name)
+                {
+                    slot.insert(finding);
+                }
+            }
+        }
+    }
+    by_site.into_values().collect()
+}
+
 /// Orders findings by path then line, the stable shape every mode reports.
 fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
@@ -419,5 +560,59 @@ pub(crate) mod test_support {
         severity: &str,
     ) -> Detector {
         Detector::new(name, pattern, finding_type, severity, &[], &[], None).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_findings;
+    use crate::report::{Finding, Severity};
+
+    fn finding(detector: &str, severity: Severity, matched: &str, line: usize) -> Finding {
+        Finding {
+            file_path: "src/lib.rs".to_string(),
+            line_number: line,
+            finding_type: "test".to_string(),
+            severity,
+            matched_content: matched.to_string(),
+            detector_name: detector.to_string(),
+        }
+    }
+
+    #[test]
+    fn dedupe_findings_keeps_the_most_severe_detector() {
+        let findings = vec![
+            finding("LowDetector", Severity::Low, "secret", 10),
+            finding("HighDetector", Severity::High, "secret", 10),
+            finding("HighDetector", Severity::High, "other", 10),
+        ];
+
+        let deduped = dedupe_findings(findings);
+
+        assert_eq!(deduped.len(), 2);
+        assert!(
+            deduped
+                .iter()
+                .any(|finding| finding.detector_name == "HighDetector"
+                    && finding.matched_content == "secret")
+        );
+        assert!(
+            !deduped
+                .iter()
+                .any(|finding| finding.severity == Severity::Low)
+        );
+    }
+
+    #[test]
+    fn dedupe_findings_breaks_ties_by_detector_name() {
+        let findings = vec![
+            finding("ZetaDetector", Severity::High, "secret", 10),
+            finding("AlphaDetector", Severity::High, "secret", 10),
+        ];
+
+        let deduped = dedupe_findings(findings);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].detector_name, "AlphaDetector");
     }
 }
